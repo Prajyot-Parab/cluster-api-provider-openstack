@@ -1,0 +1,492 @@
+apiVersion: v1
+data:
+  cacert: ${OPENSTACK_CLOUD_CACERT_B64}
+  clouds.yaml: ${OPENSTACK_CLOUD_YAML_B64}
+kind: Secret
+metadata:
+  labels:
+    clusterctl.cluster.x-k8s.io/move: "true"
+  name: ${CLUSTER_NAME}-cloud-config
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: ${CLUSTER_NAME}-md-0
+spec:
+  template:
+    spec:
+      files: []
+      joinConfiguration:
+        nodeRegistration:
+          kubeletExtraArgs:
+            cloud-provider: external
+          name: '{{ ds.meta_data.name }}'
+      preKubeadmCommands:
+      - hostnamectl set-hostname "{{ ds.meta_data.name }}"
+      - echo "::1         ipv6-localhost ipv6-loopback" >/etc/hosts
+      - echo "127.0.0.1   {{ ds.meta_data.name }} {{ local_hostname }} localhost
+        localhost.localdomain localhost4 localhost4.localdomain4" >>/etc/hosts
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  labels:
+    ccm: external
+  name: ${CLUSTER_NAME}
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 192.168.0.0/16
+    serviceDomain: cluster.local
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: ${CLUSTER_NAME}-control-plane
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+    kind: OpenStackCluster
+    name: ${CLUSTER_NAME}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: ${CLUSTER_NAME}-md-0
+spec:
+  clusterName: ${CLUSTER_NAME}
+  replicas: ${WORKER_MACHINE_COUNT}
+  selector:
+    matchLabels: null
+  template:
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: ${CLUSTER_NAME}-md-0
+      clusterName: ${CLUSTER_NAME}
+      failureDomain: ${OPENSTACK_FAILURE_DOMAIN}
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+        kind: OpenStackMachineTemplate
+        name: ${CLUSTER_NAME}-md-0
+      version: ${KUBERNETES_VERSION}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: ${CLUSTER_NAME}-control-plane
+spec:
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      apiServer:
+        extraArgs:
+          cloud-provider: external
+      controllerManager:
+        extraArgs:
+          cloud-provider: external
+    files: []
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+        name: '{{ ds.meta_data.name }}'
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+        name: '{{ ds.meta_data.name }}'
+    preKubeadmCommands:
+      - hostnamectl set-hostname "{{ ds.meta_data.name }}"
+      - echo "::1         ipv6-localhost ipv6-loopback" >/etc/hosts
+      - echo "127.0.0.1   localhost" >>/etc/hosts
+      - echo "127.0.0.1   {{ ds.meta_data.name }}" >>/etc/hosts
+      - echo "{{ ds.meta_data.name }}" >/etc/hostname
+    files:
+      - path: /etc/kubernetes/manifests/kube-vip.yaml
+        content: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            creationTimestamp: null
+            name: kube-vip
+            namespace: kube-system
+          spec:
+            containers:
+            - args:
+              - manager
+              env:
+              - name: vip_arp
+                value: "true"
+              - name: port
+                value: "6443"
+              - name: vip_interface
+                value: env2
+              - name: vip_cidr
+                value: "${POWERVC_VIP_CIDR}"
+              - name: cp_enable
+                value: "true"
+              - name: cp_namespace
+                value: kube-system
+              - name: vip_ddns
+                value: "false"
+              - name: svc_enable
+                value: "true"
+              - name: vip_leaderelection
+                value: "true"
+              - name: vip_leaseduration
+                value: "5"
+              - name: vip_renewdeadline
+                value: "3"
+              - name: vip_retryperiod
+                value: "1"
+              - name: address
+                value: "${POWERVC_VIP}"
+              image: ghcr.io/kube-vip/kube-vip:v0.4.4
+              imagePullPolicy: Always
+              name: kube-vip
+              resources: {}
+              securityContext:
+                capabilities:
+                  add:
+                  - NET_ADMIN
+                  - NET_RAW
+              volumeMounts:
+              - mountPath: /etc/kubernetes/admin.conf
+                name: kubeconfig
+            hostAliases:
+            - hostnames:
+              - kubernetes
+              ip: 127.0.0.1
+            hostNetwork: true
+            volumes:
+            - hostPath:
+                path: /etc/kubernetes/admin.conf
+              name: kubeconfig
+          status: {}
+        owner: "root:root"
+        permissions: "0744"
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+      kind: OpenStackMachineTemplate
+      name: ${CLUSTER_NAME}-control-plane
+  replicas: 1
+  version: ${KUBERNETES_VERSION}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+kind: OpenStackCluster
+metadata:
+  name: ${CLUSTER_NAME}
+spec:
+  cloudName: ${OPENSTACK_CLOUD}
+  identityRef:
+    kind: Secret
+    name: ${CLUSTER_NAME}-cloud-config
+  network:
+    id: ${OPENSTACK_EXTERNAL_NETWORK_ID}
+  disableAPIServerFloatingIP: true
+  apiServerFixedIP: "${POWERVC_VIP}"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+kind: OpenStackMachineTemplate
+metadata:
+  name: ${CLUSTER_NAME}-control-plane
+spec:
+  template:
+    spec:
+      cloudName: ${OPENSTACK_CLOUD}
+      flavor: ${OPENSTACK_CONTROL_PLANE_MACHINE_FLAVOR}
+      identityRef:
+        kind: Secret
+        name: ${CLUSTER_NAME}-cloud-config
+      image: ${OPENSTACK_IMAGE_NAME}
+      ports:
+      - network:
+          id: ${OPENSTACK_EXTERNAL_NETWORK_ID}
+      sshKeyName: ${OPENSTACK_SSH_KEY_NAME}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+kind: OpenStackMachineTemplate
+metadata:
+  name: ${CLUSTER_NAME}-md-0
+spec:
+  template:
+    spec:
+      cloudName: ${OPENSTACK_CLOUD}
+      flavor: ${OPENSTACK_NODE_MACHINE_FLAVOR}
+      identityRef:
+        kind: Secret
+        name: ${CLUSTER_NAME}-cloud-config
+      image: ${OPENSTACK_IMAGE_NAME}
+      ports:
+      - network:
+          id: ${OPENSTACK_EXTERNAL_NETWORK_ID}
+      sshKeyName: ${OPENSTACK_SSH_KEY_NAME}
+---
+apiVersion: addons.cluster.x-k8s.io/v1beta1
+kind: ClusterResourceSet
+metadata:
+  name: crs-cloud-conf
+spec:
+  clusterSelector:
+    matchLabels:
+      ccm: external
+  resources:
+    - kind: Secret
+      name: powervc-cacert-credential
+    - kind: Secret
+      name: powervc-cloud-credential
+    - kind: ConfigMap
+      name: cloud-controller-manager-addon
+  strategy: ApplyOnce
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: powervc-cacert-credential
+type: addons.cluster.x-k8s.io/resource-set
+stringData:
+  powervc-cacert-credential.yaml: |-
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: powervc-cacert-credential
+      namespace: kube-system
+    data:
+      cacert: ${OPENSTACK_CLOUD_CACERT_B64}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: powervc-cloud-credential
+type: addons.cluster.x-k8s.io/resource-set
+stringData:
+  powervc-cloud-credential.yaml: |-
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: powervc-cloud-credential
+      namespace: kube-system
+    data:
+      cloud.conf: ${OPENSTACK_CLOUD_PROVIDER_CONF_B64}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-controller-manager-addon
+data:
+  powervc-ccm-external.yaml: |-
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: cloud-controller-manager
+      namespace: kube-system
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: cloud-controller-manager:apiserver-authentication-reader
+      namespace: kube-system
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: extension-apiserver-authentication-reader
+    subjects:
+      - apiGroup: ""
+        kind: ServiceAccount
+        name: cloud-controller-manager
+        namespace: kube-system
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: system:cloud-controller-manager
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: system:cloud-controller-manager
+    subjects:
+      - kind: ServiceAccount
+        name: cloud-controller-manager
+        namespace: kube-system
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: system:cloud-controller-manager
+    rules:
+      - apiGroups:
+          - ""
+        resources:
+          - events
+        verbs:
+          - create
+          - patch
+          - update
+      - apiGroups:
+          - ""
+        resources:
+          - nodes
+        verbs:
+          - "*"
+      - apiGroups:
+          - ""
+        resources:
+          - nodes/status
+        verbs:
+          - patch
+      - apiGroups:
+          - ""
+        resources:
+          - services
+        verbs:
+          - list
+          - patch
+          - update
+          - watch
+      - apiGroups:
+          - ""
+        resources:
+          - services/status
+        verbs:
+          - patch
+      - apiGroups:
+          - ""
+        resources:
+          - serviceaccounts
+        verbs:
+          - create
+          - get
+          - list
+          - watch
+          - update
+      - apiGroups:
+          - ""
+        resources:
+          - persistentvolumes
+        verbs:
+          - get
+          - list
+          - update
+          - watch
+      - apiGroups:
+          - ""
+        resources:
+          - endpoints
+        verbs:
+          - create
+          - get
+          - list
+          - watch
+          - update
+      - apiGroups:
+          - ""
+        resources:
+          - secrets
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - "coordination.k8s.io"
+        resources:
+          - leases
+        verbs:
+          - create
+          - get
+          - list
+          - watch
+          - update
+      - apiGroups:
+          - ""
+        resourceNames:
+          - node-controller
+          - service-controller
+        resources:
+          - serviceaccounts/token
+        verbs:
+          - create
+    ---
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: powervc-cloud-controller-manager
+      namespace: kube-system
+      labels:
+        k8s-app: powervc-cloud-controller-manager
+    spec:
+      selector:
+        matchLabels:
+          k8s-app: powervc-cloud-controller-manager
+      updateStrategy:
+        type: RollingUpdate
+      template:
+        metadata:
+          labels:
+            k8s-app: powervc-cloud-controller-manager
+        spec:
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+            - key: node.cloudprovider.kubernetes.io/uninitialized
+              value: "true"
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/master
+              effect: NoSchedule
+              operator: Exists
+            - key: node-role.kubernetes.io/control-plane
+              effect: NoSchedule
+              operator: Exists
+            - key: node.kubernetes.io/not-ready
+              effect: NoSchedule
+              operator: Exists
+          serviceAccountName: cloud-controller-manager
+          containers:
+            - name: powervc-cloud-controller-manager
+              image: registry.k8s.io/provider-os/openstack-cloud-controller-manager:v1.27.1
+              args:
+                - /bin/openstack-cloud-controller-manager
+                - --v=1
+                - --cluster-name=$(CLUSTER_NAME)
+                - --cloud-config=$(CLOUD_CONFIG)
+                - --cloud-provider=openstack
+                - --use-service-account-credentials=true
+                - --bind-address=127.0.0.1
+              volumeMounts:
+                - mountPath: /etc/kubernetes/pki
+                  name: k8s-certs
+                  readOnly: true
+                - mountPath: /etc/ssl/certs
+                  name: ca-certs
+                  readOnly: true
+                - mountPath: /etc/config
+                  name: cloud-config-volume
+                  readOnly: true
+                - mountPath: /etc/certs
+                  name: cacert-volume
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 200m
+              env:
+                - name: CLOUD_CONFIG
+                  value: /etc/config/cloud.conf
+                - name: CLUSTER_NAME
+                  value: kubernetes
+          hostNetwork: true
+          volumes:
+          - hostPath:
+              path: /etc/kubernetes/pki
+              type: DirectoryOrCreate
+            name: k8s-certs
+          - hostPath:
+              path: /etc/ssl/certs
+              type: DirectoryOrCreate
+            name: ca-certs
+          - name: cloud-config-volume
+            secret:
+              secretName: powervc-cloud-credential
+          - name: cacert-volume
+            secret:
+              secretName: powervc-cacert-credential
